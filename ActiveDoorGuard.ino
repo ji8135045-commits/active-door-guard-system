@@ -1,8 +1,6 @@
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
-// WS2812B support is disabled until the strip is installed.
-// Uncomment this include and the RGB sections below when the hardware is ready.
-// #include <Adafruit_NeoPixel.h>
+#include <Adafruit_NeoPixel.h>
 
 // Some ESP32 board packages do not define LED_BUILTIN. GPIO 2 is common on
 // ESP32 DevKit boards; check your exact board if its built-in LED is elsewhere.
@@ -18,7 +16,7 @@
 //   and a pull-down; connect the buzzer supply ground to ESP32 ground.
 // - A flyback diode is needed for an inductive buzzer, but not usually for a
 //   piezo element. Verify the buzzer type and polarity before wiring.
-// Future WS2812B wiring (15 LEDs): connect DIN through a 5 V logic-level shifter
+// WS2812B wiring (8 LEDs): connect DIN through a 5 V logic-level shifter
 // (74AHCT125/74HCT245 recommended); share grounds; use an external 5 V supply,
 // a 330-470 ohm DIN resistor, and a bulk capacitor at the strip power input.
 
@@ -26,38 +24,37 @@
 constexpr uint8_t I2C_SDA_PIN = 21;
 constexpr uint8_t I2C_SCL_PIN = 22;
 // Logic signal for a transistor/MOSFET; never drive a 5 V buzzer directly.
-constexpr uint8_t BUZZER_PIN = 25;
+constexpr uint8_t BUZZER_PIN = 32;
 constexpr uint8_t STATUS_LED_PIN = LED_BUILTIN;
 constexpr bool STATUS_LED_ACTIVE_LOW = false;
-// WS2812B planned settings, currently disabled until the strip is installed.
-/*
-constexpr uint8_t RGB_DATA_PIN = 27;
-constexpr uint16_t RGB_LED_COUNT = 15;
+constexpr uint8_t RGB_DATA_PIN = 13;
+constexpr uint16_t RGB_LED_COUNT = 8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                ;
 // Conservative software brightness limit; increase only after checking supply
-// capacity and strip temperature. Full-white at 100% can approach 0.9 A total.
-constexpr uint8_t RGB_BRIGHTNESS = 40;
+// capacity and strip temperature.
+constexpr uint8_t RGB_STRIP_BRIGHTNESS = 40;
 constexpr uint32_t RGB_ERROR_BLINK_INTERVAL_MS = 500;
-*/
 
 // Polling cadence and recovery policy.
 constexpr uint32_t MEASUREMENT_INTERVAL_MS = 100;
 constexpr uint32_t SENSOR_RETRY_INTERVAL_MS = 2000;
 constexpr uint32_t ERROR_LOG_INTERVAL_MS = 2000;
 constexpr uint32_t STALE_DATA_TIMEOUT_MS = 500;
+constexpr Adafruit_VL53L0X::VL53L0X_Sense_config_t TOF_RANGE_PROFILE =
+    Adafruit_VL53L0X::VL53L0X_SENSE_LONG_RANGE;
 // Values above the normal VL53L0X range are treated as invalid/sentinel data.
 constexpr uint16_t MAX_PLAUSIBLE_DISTANCE_MM = 4000;
 // Onboard LED blink half-period is mapped from near (fast) to far (slow).
 constexpr uint16_t LED_SPEED_NEAR_MM = 50;
-constexpr uint16_t LED_SPEED_FAR_MM = 2000;
-constexpr uint32_t LED_FAST_INTERVAL_MS = 100;
-constexpr uint32_t LED_SLOW_INTERVAL_MS = 1000;
-constexpr uint32_t LED_ERROR_INTERVAL_MS = 100;
-constexpr uint32_t ALERT_BEEP_INTERVAL_MS = 3000;
-constexpr uint32_t WARNING_BEEP_INTERVAL_MS = 1000;
+constexpr uint16_t LED_SPEED_FAR_MM = 1000;
+constexpr uint32_t LED_FAST_INTERVAL_MS = 10;
+constexpr uint32_t LED_SLOW_INTERVAL_MS = 3000;
+constexpr uint32_t LED_ERROR_INTERVAL_MS = 10000;
+constexpr uint32_t ALERT_BEEP_INTERVAL_MS = 500;
+constexpr uint32_t WARNING_BEEP_INTERVAL_MS = 100;
 constexpr uint32_t BEEP_DURATION_MS = 100;
 constexpr uint32_t ERROR_BEEP_INTERVAL_MS = 1000;
 constexpr uint32_t ERROR_BEEP_DURATION_MS = 250;
-constexpr uint16_t WARNING_DISTANCE_MM = 100;
+constexpr uint16_t WARNING_DISTANCE_MM = 180;
 constexpr uint16_t SAFE_DISTANCE_MM = 300;
 constexpr uint8_t MAX_CONSECUTIVE_MEASUREMENT_ERRORS = 3;
 
@@ -65,9 +62,7 @@ static_assert(I2C_SDA_PIN != I2C_SCL_PIN, "I2C SDA and SCL must use different pi
 
 Adafruit_VL53L0X tof;
 VL53L0X_RangingMeasurementData_t measurement;
-/* WS2812B control is disabled until the strip is installed.
 Adafruit_NeoPixel rgbStrip(RGB_LED_COUNT, RGB_DATA_PIN, NEO_GRB + NEO_KHZ800);
-*/
 
 enum class SystemState : uint8_t {
   SAFE,
@@ -89,6 +84,8 @@ uint32_t lastValidMeasurementAt = 0;
 uint32_t lastStatusLedToggleAt = 0;
 uint16_t latestDistanceMm = SAFE_DISTANCE_MM;
 bool statusLedOn = false;
+bool rgbErrorOn = true;
+uint32_t lastRgbErrorToggleAt = 0;
 
 uint32_t statusLedIntervalMs(SystemState state, uint16_t distanceMm) {
   if (state == SystemState::SENSOR_ERROR) {
@@ -102,7 +99,6 @@ uint32_t statusLedIntervalMs(SystemState state, uint16_t distanceMm) {
              LED_SPEED_NEAR_MM, LED_SPEED_FAR_MM,
              LED_FAST_INTERVAL_MS, LED_SLOW_INTERVAL_MS);
 }
-/* WS2812B control helpers; re-enable together with the library/include above.
 void fillRgbStrip(uint8_t red, uint8_t green, uint8_t blue) {
   rgbStrip.fill(rgbStrip.Color(red, green, blue));
   rgbStrip.show();
@@ -114,18 +110,33 @@ void showStateColor(SystemState state) {
       fillRgbStrip(0, 255, 0);
       break;
     case SystemState::ALERT:
-      fillRgbStrip(0, 0, 255);
+      fillRgbStrip(255, 127, 0);
       break;
     case SystemState::WARNING:
       fillRgbStrip(255, 0, 0);
       break;
     case SystemState::SENSOR_ERROR:
       rgbErrorOn = true;
-      fillRgbStrip(255, 70, 0);
+      lastRgbErrorToggleAt = millis();
+      fillRgbStrip(0, 0, 255);
       break;
   }
 }
-*/
+
+void updateRgbErrorBlink(uint32_t now) {
+  if (currentState != SystemState::SENSOR_ERROR ||
+      now - lastRgbErrorToggleAt < RGB_ERROR_BLINK_INTERVAL_MS) {
+    return;
+  }
+
+  lastRgbErrorToggleAt = now;
+  rgbErrorOn = !rgbErrorOn;
+  if (rgbErrorOn) {
+    fillRgbStrip(255, 70, 0);
+  } else {
+    fillRgbStrip(0, 0, 0);
+  }
+}
 
 const char *stateName(SystemState state) {
   switch (state) {
@@ -156,11 +167,11 @@ void setState(SystemState newState) {
   if (!stateReported || newState != currentState) {
     currentState = newState;
     stateReported = true;
-    Serial.print('[');
-    Serial.print(millis());
-    Serial.print(" ms] State changed: ");
-    Serial.println(stateName(currentState));
-    // showStateColor(currentState);  // WS2812B temporarily disabled.
+    // Serial.print('[');
+    // Serial.print(millis());
+    // Serial.print(" ms] State changed: ");
+    // Serial.println(stateName(currentState));
+    showStateColor(currentState);
   }
 }
 
@@ -174,13 +185,13 @@ void updateStatusLed(SystemState state, uint16_t distanceMm, uint32_t now) {
     const uint8_t outputLevel = statusLedOn ? HIGH : LOW;
     digitalWrite(STATUS_LED_PIN,
                  STATUS_LED_ACTIVE_LOW ? !outputLevel : outputLevel);
-    Serial.print('[');
-    Serial.print(now);
-    Serial.print(" ms] Status LED=");
-    Serial.print(statusLedOn ? "ON" : "OFF");
-    Serial.print(", half-period=");
-    Serial.print(interval);
-    Serial.println(" ms");
+    // Serial.print('[');
+    // Serial.print(now);
+    // Serial.print(" ms] Status LED=");
+    // Serial.print(statusLedOn ? "ON" : "OFF");
+    // Serial.print(", half-period=");
+    // Serial.print(interval);
+    // Serial.println(" ms");
   }
 }
 
@@ -193,9 +204,9 @@ void updateBuzzer(SystemState state, uint32_t now) {
 
   if (state == SystemState::SAFE) {
     if (beepIsOn) {
-      Serial.print('[');
-      Serial.print(now);
-      Serial.println(" ms] Buzzer=OFF (SAFE)");
+      // Serial.print('[');
+      // Serial.print(now);
+      // Serial.println(" ms] Buzzer=OFF (SAFE)");
     }
     digitalWrite(BUZZER_PIN, LOW);
     scheduleStarted = false;
@@ -221,19 +232,19 @@ void updateBuzzer(SystemState state, uint32_t now) {
     lastBeepAt = now;
     beepStartedAt = now;
     digitalWrite(BUZZER_PIN, HIGH);
-    Serial.print('[');
-    Serial.print(now);
-    Serial.print(" ms] Buzzer=ON, state=");
-    Serial.println(stateName(state));
+    // Serial.print('[');
+    // Serial.print(now);
+    // Serial.print(" ms] Buzzer=ON, state=");
+    // Serial.println(stateName(state));
     return;
   }
 
   if (beepIsOn && now - beepStartedAt >= duration) {
     digitalWrite(BUZZER_PIN, LOW);
     beepIsOn = false;
-    Serial.print('[');
-    Serial.print(now);
-    Serial.println(" ms] Buzzer=OFF");
+    // Serial.print('[');
+    // Serial.print(now);
+    // Serial.println(" ms] Buzzer=OFF");
   }
 
   if (!beepIsOn && now - lastBeepAt >= interval) {
@@ -241,10 +252,10 @@ void updateBuzzer(SystemState state, uint32_t now) {
     beepIsOn = true;
     lastBeepAt = now;
     beepStartedAt = now;
-    Serial.print('[');
-    Serial.print(now);
-    Serial.print(" ms] Buzzer=ON, state=");
-    Serial.println(stateName(state));
+    // Serial.print('[');
+    // Serial.print(now);
+    // Serial.print(" ms] Buzzer=ON, state=");
+    // Serial.println(stateName(state));
   }
 }
 
@@ -278,17 +289,29 @@ void handleMeasurementFailure(uint8_t rangeStatus, uint32_t now) {
   }
 }
 
+bool initializeTof() {
+  Wire.beginTransmission(VL53L0X_I2C_ADDR);
+  const uint8_t i2cError = Wire.endTransmission();
+  if (i2cError == 0) {
+    Serial.println("VL53L0X responded at I2C address 0x29");
+  } else {
+    Serial.print("No I2C response at 0x29; Wire error=");
+    Serial.println(i2cError);
+  }
+
+  return tof.begin(VL53L0X_I2C_ADDR, true, &Wire, TOF_RANGE_PROFILE);
+}
+
 void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
   pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_LOW ? HIGH : LOW);
 
-  // WS2812B initialization is disabled until the strip is installed.
-  // rgbStrip.begin();
-  // rgbStrip.setBrightness(RGB_BRIGHTNESS);
-  // rgbStrip.clear();
-  // rgbStrip.show();
+  rgbStrip.begin();
+  rgbStrip.setBrightness(RGB_STRIP_BRIGHTNESS);
+  rgbStrip.clear();
+  rgbStrip.show();
 
   Serial.begin(115200);
   Serial.println();
@@ -303,14 +326,14 @@ void setup() {
   Serial.print("Buzzer control pin: GPIO ");
   Serial.println(BUZZER_PIN);
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(400000);
+  Wire.setClock(100000);
   // ESP32 Arduino Wire timeout prevents a stuck I2C transfer from blocking forever.
   Wire.setTimeOut(50);
 
   Serial.println("Active door guard starting");
   setState(SystemState::SENSOR_ERROR);
 
-  sensorReady = tof.begin();
+  sensorReady = initializeTof();
   lastSensorRetryAt = millis();
   if (sensorReady) {
     Serial.println("VL53L0X initialized");
@@ -327,7 +350,7 @@ void loop() {
     Serial.print('[');
     Serial.print(now);
     Serial.println(" ms] Retrying VL53L0X initialization");
-    sensorReady = tof.begin();
+    sensorReady = initializeTof();
     if (sensorReady) {
       consecutiveMeasurementErrors = 0;
       hasValidMeasurement = false;
@@ -384,5 +407,5 @@ void loop() {
 
   updateBuzzer(currentState, millis());
   updateStatusLed(currentState, latestDistanceMm, millis());
-  // updateRgbErrorBlink(millis());  // WS2812B temporarily disabled.
+  updateRgbErrorBlink(millis());
 }
